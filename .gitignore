@@ -1,0 +1,34 @@
+# ROS 2 generated folders
+build/
+install/
+log/
+
+# Python generated files
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editor settings
+.vscode/
+
+# ROS bags
+*.bag
+*.db3
+*.mcap
+
+# LiDAR and dataset files
+KITTI/
+KITTI_*/
+dataset/
+datasets/
+*.bin
+*.label
+*.pcd
+*.ply
+
+# Temporary files
+*.tmp
+*.log
+*~
+.DS_Store
