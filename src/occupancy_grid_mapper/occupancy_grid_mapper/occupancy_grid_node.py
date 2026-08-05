@@ -1,5 +1,4 @@
 import math
-from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -9,8 +8,10 @@ from rclpy.qos import (
     DurabilityPolicy,
     QoSProfile,
     ReliabilityPolicy,
+    qos_profile_sensor_data,
 )
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
 from visualization_msgs.msg import Marker
 
 
@@ -19,24 +20,21 @@ class OccupancyGridNode(Node):
     def __init__(self):
         super().__init__("occupancy_grid_node")
 
-        # Dataset playback
+        # Point-cloud input
         self.declare_parameter(
-            "dataset_path",
-            "/home/leon/KITTI_filtered/dataset",
+            "input_topic",
+            "/patchworkpp/nonground",
         )
-        self.declare_parameter("sequence", "00")
-        self.declare_parameter("rate_hz", 1.0)
-        self.declare_parameter("loop", True)
 
-        # ROI and obstacle height
+        # Mapping/ROI area
         self.declare_parameter("x_min", -10.0)
         self.declare_parameter("x_max", 50.0)
         self.declare_parameter("y_min", -25.0)
         self.declare_parameter("y_max", 25.0)
-        self.declare_parameter("obstacle_z_min", -1.2)
-        self.declare_parameter("obstacle_z_max", 2.5)
+        self.declare_parameter("z_min", -1.2)
+        self.declare_parameter("z_max", 2.5)
 
-        # Grid
+        # Grid settings
         self.declare_parameter("resolution", 0.20)
         self.declare_parameter("min_points_per_cell", 2)
         self.declare_parameter("angle_bins", 720)
@@ -51,30 +49,16 @@ class OccupancyGridNode(Node):
         self.declare_parameter("hitch_distance", 8.0)
         self.declare_parameter("hitch_angle_deg", 0.0)
 
-        self.dataset_path = Path(
-            self.get_parameter("dataset_path").value
-        )
-        self.sequence = str(
-            self.get_parameter("sequence").value
-        )
-        self.rate_hz = float(
-            self.get_parameter("rate_hz").value
-        )
-        self.loop = bool(
-            self.get_parameter("loop").value
+        self.input_topic = str(
+            self.get_parameter("input_topic").value
         )
 
         self.x_min = float(self.get_parameter("x_min").value)
         self.x_max = float(self.get_parameter("x_max").value)
         self.y_min = float(self.get_parameter("y_min").value)
         self.y_max = float(self.get_parameter("y_max").value)
-
-        self.z_min = float(
-            self.get_parameter("obstacle_z_min").value
-        )
-        self.z_max = float(
-            self.get_parameter("obstacle_z_max").value
-        )
+        self.z_min = float(self.get_parameter("z_min").value)
+        self.z_max = float(self.get_parameter("z_max").value)
 
         self.resolution = float(
             self.get_parameter("resolution").value
@@ -108,33 +92,11 @@ class OccupancyGridNode(Node):
 
         self.validate_parameters()
 
-        self.velodyne_dir = (
-            self.dataset_path
-            / self.sequence
-            / "velodyne"
+        self.width = math.ceil(
+            (self.x_max - self.x_min) / self.resolution
         )
-        self.label_dir = (
-            self.dataset_path
-            / self.sequence
-            / "labels"
-        )
-
-        self.frames = sorted(self.velodyne_dir.glob("*.bin"))
-
-        if not self.frames:
-            raise RuntimeError(
-                f"No KITTI frames found in {self.velodyne_dir}"
-            )
-
-        self.width = int(
-            math.ceil(
-                (self.x_max - self.x_min) / self.resolution
-            )
-        )
-        self.height = int(
-            math.ceil(
-                (self.y_max - self.y_min) / self.resolution
-            )
+        self.height = math.ceil(
+            (self.y_max - self.y_min) / self.resolution
         )
 
         self.sensor_x = int(
@@ -144,21 +106,16 @@ class OccupancyGridNode(Node):
             (0.0 - self.y_min) / self.resolution
         )
 
-        # Aircraft centre is placed in front of the tug.
-        self.aircraft_centre_x = (
+        # Aircraft centre relative to the tug.
+        self.aircraft_x = (
             self.tug_length / 2.0
             + self.hitch_distance
             + self.aircraft_length / 2.0
         )
-        self.aircraft_centre_y = 0.0
+        self.aircraft_y = 0.0
 
         self.self_mask = self.create_self_mask()
 
-        point_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-        )
-        # QOS can be changed to best effort
         map_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -167,39 +124,43 @@ class OccupancyGridNode(Node):
 
         self.before_pub = self.create_publisher(
             PointCloud2,
-            "/simplified/points_before_mask",
-            point_qos,
+            "/mapping/points_before_mask",
+            qos_profile_sensor_data,
         )
+
         self.after_pub = self.create_publisher(
             PointCloud2,
-            "/simplified/points_after_mask",
-            point_qos,
+            "/mapping/points_after_mask",
+            qos_profile_sensor_data,
         )
+
         self.grid_pub = self.create_publisher(
             OccupancyGrid,
-            "/simplified/occupancy_grid",
+            "/occupancy_grid",
             map_qos,
         )
+
         self.tug_pub = self.create_publisher(
             Marker,
-            "/simplified/tug_marker",
+            "/mapping/tug_marker",
             map_qos,
         )
+
         self.aircraft_pub = self.create_publisher(
             Marker,
-            "/simplified/aircraft_marker",
+            "/mapping/aircraft_marker",
             map_qos,
         )
 
-        self.frame_index = 0
-
-        self.timer = self.create_timer(
-            1.0 / self.rate_hz,
-            self.process_next_frame,
+        self.subscription = self.create_subscription(
+            PointCloud2,
+            self.input_topic,
+            self.cloud_callback,
+            qos_profile_sensor_data,
         )
 
         self.get_logger().info(
-            f"Loaded {len(self.frames)} KITTI frames"
+            f"Listening to {self.input_topic}"
         )
         self.get_logger().info(
             f"Grid: {self.width} x {self.height}, "
@@ -207,12 +168,6 @@ class OccupancyGridNode(Node):
         )
 
     def validate_parameters(self):
-        if self.rate_hz <= 0.0:
-            raise ValueError("rate_hz must be positive")
-
-        if self.resolution <= 0.0:
-            raise ValueError("resolution must be positive")
-
         if self.x_min >= self.x_max:
             raise ValueError("Invalid x limits")
 
@@ -220,98 +175,103 @@ class OccupancyGridNode(Node):
             raise ValueError("Invalid y limits")
 
         if self.z_min >= self.z_max:
-            raise ValueError("Invalid obstacle height limits")
+            raise ValueError("Invalid height limits")
 
-    def process_next_frame(self):
-        if self.frame_index >= len(self.frames):
-            if not self.loop:
-                self.timer.cancel()
+        if self.resolution <= 0.0:
+            raise ValueError("Resolution must be positive")
+
+        if self.min_points < 1:
+            raise ValueError(
+                "min_points_per_cell must be at least 1"
+            )
+
+    def cloud_callback(self, msg):
+        try:
+            field_names = {field.name for field in msg.fields}
+
+            if not {"x", "y", "z"}.issubset(field_names):
+                self.get_logger().error(
+                    "Point cloud does not contain x, y and z fields"
+                )
                 return
 
-            self.frame_index = 0
-
-        bin_path = self.frames[self.frame_index]
-        label_path = self.label_dir / f"{bin_path.stem}.label"
-
-        points = np.fromfile(
-            bin_path,
-            dtype=np.float32,
-        ).reshape(-1, 4)
-
-        # Remove selected object classes when labels exist.
-        if label_path.exists():
-            labels = np.fromfile(
-                label_path,
-                dtype=np.uint32,
+            points = point_cloud2.read_points_numpy(
+                msg,
+                field_names=["x", "y", "z"],
+                skip_nans=True,
             )
 
-            count = min(len(points), len(labels))
-            points = points[:count]
-            labels = labels[:count]
+            points = np.asarray(
+                points,
+                dtype=np.float32,
+            ).reshape(-1, 3)
 
-            semantic_ids = labels & 0xFFFF
+            if len(points) == 0:
+                return
 
-            remove_classes = np.array(
-                [13, 18, 257, 258],
-                dtype=np.uint32,
+            # Keep the required region and height.
+            roi = (
+                (points[:, 0] >= self.x_min)
+                & (points[:, 0] < self.x_max)
+                & (points[:, 1] >= self.y_min)
+                & (points[:, 1] < self.y_max)
+                & (points[:, 2] >= self.z_min)
+                & (points[:, 2] <= self.z_max)
             )
 
-            points = points[
-                ~np.isin(semantic_ids, remove_classes)
-            ]
+            before_mask = points[roi]
 
-        # Keep only the required ROI and obstacle height.
-        roi_mask = (
-            (points[:, 0] >= self.x_min)
-            & (points[:, 0] < self.x_max)
-            & (points[:, 1] >= self.y_min)
-            & (points[:, 1] < self.y_max)
-            & (points[:, 2] >= self.z_min)
-            & (points[:, 2] <= self.z_max)
-        )
+            # Ignore tug and aircraft regions.
+            self_points = (
+                self.inside_tug(before_mask)
+                | self.inside_aircraft(before_mask)
+            )
 
-        before_mask = points[roi_mask]
+            after_mask = before_mask[~self_points]
 
-        # Remove simulated tug and aircraft points.
-        tug_mask = self.points_inside_tug(before_mask)
-        aircraft_mask = self.points_inside_aircraft(before_mask)
+            self.before_pub.publish(
+                point_cloud2.create_cloud_xyz32(
+                    msg.header,
+                    before_mask,
+                )
+            )
 
-        after_mask = before_mask[
-            ~(tug_mask | aircraft_mask)
-        ]
+            self.after_pub.publish(
+                point_cloud2.create_cloud_xyz32(
+                    msg.header,
+                    after_mask,
+                )
+            )
 
-        stamp = self.get_clock().now().to_msg()
+            self.grid_pub.publish(
+                self.create_grid(
+                    after_mask,
+                    msg.header,
+                )
+            )
 
-        self.before_pub.publish(
-            self.make_cloud(before_mask, stamp)
-        )
-        self.after_pub.publish(
-            self.make_cloud(after_mask, stamp)
-        )
+            self.publish_markers(msg.header)
 
-        self.grid_pub.publish(
-            self.make_grid(after_mask, stamp)
-        )
+            self.get_logger().info(
+                f"Input: {len(points)}, "
+                f"ROI: {len(before_mask)}, "
+                f"mapped: {len(after_mask)}"
+            )
 
-        self.publish_markers(stamp)
+        except Exception as error:
+            self.get_logger().error(
+                f"Point-cloud processing failed: {error}"
+            )
 
-        self.get_logger().info(
-            f"{bin_path.name}: "
-            f"{len(before_mask)} before mask, "
-            f"{len(after_mask)} after mask"
-        )
-
-        self.frame_index += 1
-
-    def points_inside_tug(self, points):
+    def inside_tug(self, points):
         return (
             (np.abs(points[:, 0]) <= self.tug_length / 2.0)
             & (np.abs(points[:, 1]) <= self.tug_width / 2.0)
         )
 
-    def points_inside_aircraft(self, points):
-        dx = points[:, 0] - self.aircraft_centre_x
-        dy = points[:, 1] - self.aircraft_centre_y
+    def inside_aircraft(self, points):
+        dx = points[:, 0] - self.aircraft_x
+        dy = points[:, 1] - self.aircraft_y
 
         cosine = math.cos(self.hitch_angle)
         sine = math.sin(self.hitch_angle)
@@ -325,26 +285,27 @@ class OccupancyGridNode(Node):
         )
 
     def create_self_mask(self):
-        x_values = (
+        x = (
             self.x_min
             + (np.arange(self.width) + 0.5)
             * self.resolution
         )
-        y_values = (
+
+        y = (
             self.y_min
             + (np.arange(self.height) + 0.5)
             * self.resolution
         )
 
-        grid_x, grid_y = np.meshgrid(x_values, y_values)
+        grid_x, grid_y = np.meshgrid(x, y)
 
         tug = (
             (np.abs(grid_x) <= self.tug_length / 2.0)
             & (np.abs(grid_y) <= self.tug_width / 2.0)
         )
 
-        dx = grid_x - self.aircraft_centre_x
-        dy = grid_y - self.aircraft_centre_y
+        dx = grid_x - self.aircraft_x
+        dy = grid_y - self.aircraft_y
 
         cosine = math.cos(self.hitch_angle)
         sine = math.sin(self.hitch_angle)
@@ -359,14 +320,14 @@ class OccupancyGridNode(Node):
 
         return tug | aircraft
 
-    def make_grid(self, points, stamp):
+    def create_grid(self, points, header):
         grid = np.full(
             (self.height, self.width),
             -1,
             dtype=np.int8,
         )
 
-        if len(points) > 0:
+        if len(points):
             grid_x = (
                 (points[:, 0] - self.x_min)
                 / self.resolution
@@ -384,86 +345,87 @@ class OccupancyGridNode(Node):
                 minlength=self.width * self.height,
             )
 
-            valid_cells = counts[linear] >= self.min_points
-            valid_points = points[valid_cells]
-            valid_linear = linear[valid_cells]
+            valid = counts[linear] >= self.min_points
 
-            occupied = np.unique(valid_linear)
+            valid_points = points[valid]
+            occupied = np.unique(linear[valid])
 
-            # Use the nearest obstacle in each angular direction.
-            if len(valid_points) > 0:
-                angles = np.arctan2(
-                    valid_points[:, 1],
-                    valid_points[:, 0],
-                )
-
-                angle_index = (
-                    (
-                        (angles + math.pi)
-                        / (2.0 * math.pi)
-                    )
-                    * self.angle_bins
-                ).astype(np.int32) % self.angle_bins
-
-                distance = (
-                    valid_points[:, 0] ** 2
-                    + valid_points[:, 1] ** 2
-                )
-
-                order = np.argsort(distance)
-                sorted_angles = angle_index[order]
-
-                _, first = np.unique(
-                    sorted_angles,
-                    return_index=True,
-                )
-
-                nearest = valid_points[order[first]]
-
-                for point in nearest:
-                    end_x = int(
-                        (point[0] - self.x_min)
-                        / self.resolution
-                    )
-                    end_y = int(
-                        (point[1] - self.y_min)
-                        / self.resolution
-                    )
-
-                    for cell_x, cell_y in self.bresenham(
-                        self.sensor_x,
-                        self.sensor_y,
-                        end_x,
-                        end_y,
-                    )[:-1]:
-                        if (
-                            0 <= cell_x < self.width
-                            and 0 <= cell_y < self.height
-                        ):
-                            grid[cell_y, cell_x] = 0
+            self.mark_free_space(grid, valid_points)
 
             occupied_y = occupied // self.width
             occupied_x = occupied % self.width
+
             grid[occupied_y, occupied_x] = 100
 
-        # Tug and aircraft regions remain unknown.
+        # Tug and aircraft cells stay unknown.
         grid[self.self_mask] = -1
 
         message = OccupancyGrid()
-        message.header.stamp = stamp
-        message.header.frame_id = "velodyne"
-
-        message.info.map_load_time = stamp
+        message.header = header
+        message.info.map_load_time = header.stamp
         message.info.resolution = self.resolution
         message.info.width = self.width
         message.info.height = self.height
         message.info.origin.position.x = self.x_min
         message.info.origin.position.y = self.y_min
         message.info.origin.orientation.w = 1.0
-
         message.data = grid.flatten().tolist()
 
         return message
+
+    def mark_free_space(self, grid, points):
+        if len(points) == 0:
+            return
+
+        angles = np.arctan2(
+            points[:, 1],
+            points[:, 0],
+        )
+
+        angle_ids = (
+            ((angles + math.pi) / (2.0 * math.pi))
+            * self.angle_bins
+        ).astype(np.int32) % self.angle_bins
+
+        distance = (
+            points[:, 0] ** 2
+            + points[:, 1] ** 2
+        )
+
+        order = np.argsort(distance)
+
+        _, first = np.unique(
+            angle_ids[order],
+            return_index=True,
+        )
+
+        nearest_points = points[order[first]]
+
+        for point in nearest_points:
+            end_x = int(
+                (point[0] - self.x_min)
+                / self.resolution
+            )
+
+            end_y = int(
+                (point[1] - self.y_min)
+                / self.resolution
+            )
+
+            ray = self.bresenham(
+                self.sensor_x,
+                self.sensor_y,
+                end_x,
+                end_y,
+            )
+
+            for cell_x, cell_y in ray[:-1]:
+                if (
+                    0 <= cell_x < self.width
+                    and 0 <= cell_y < self.height
+                    and not self.self_mask[cell_y, cell_x]
+                ):
+                    grid[cell_y, cell_x] = 0
 
     @staticmethod
     def bresenham(x0, y0, x1, y1):
@@ -471,8 +433,10 @@ class OccupancyGridNode(Node):
 
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
+
+        step_x = 1 if x0 < x1 else -1
+        step_y = 1 if y0 < y1 else -1
+
         error = dx - dy
 
         while True:
@@ -485,105 +449,49 @@ class OccupancyGridNode(Node):
 
             if double_error > -dy:
                 error -= dy
-                x0 += sx
+                x0 += step_x
 
             if double_error < dx:
                 error += dx
-                y0 += sy
+                y0 += step_y
 
-    @staticmethod
-    def make_cloud(points, stamp):
-        message = PointCloud2()
-        message.header.stamp = stamp
-        message.header.frame_id = "velodyne"
-        message.height = 1
-        message.width = len(points)
-
-        message.fields = [
-            PointField(
-                name="x",
-                offset=0,
-                datatype=PointField.FLOAT32,
-                count=1,
-            ),
-            PointField(
-                name="y",
-                offset=4,
-                datatype=PointField.FLOAT32,
-                count=1,
-            ),
-            PointField(
-                name="z",
-                offset=8,
-                datatype=PointField.FLOAT32,
-                count=1,
-            ),
-            PointField(
-                name="intensity",
-                offset=12,
-                datatype=PointField.FLOAT32,
-                count=1,
-            ),
-        ]
-
-        message.is_bigendian = False
-        message.point_step = 16
-        message.row_step = 16 * len(points)
-        message.is_dense = False
-        message.data = np.asarray(
-            points,
-            dtype=np.float32,
-        ).tobytes()
-
-        return message
-
-    def publish_markers(self, stamp):
-        tug = self.make_marker(
-            stamp=stamp,
+    def publish_markers(self, header):
+        tug = self.create_marker(
+            header,
             marker_id=0,
-            length=self.tug_length,
-            width=self.tug_width,
             centre_x=0.0,
             centre_y=0.0,
+            length=self.tug_length,
+            width=self.tug_width,
             yaw=0.0,
-            red=0.1,
-            green=0.4,
-            blue=1.0,
         )
 
-        aircraft = self.make_marker(
-            stamp=stamp,
+        aircraft = self.create_marker(
+            header,
             marker_id=1,
+            centre_x=self.aircraft_x,
+            centre_y=self.aircraft_y,
             length=self.aircraft_length,
             width=self.aircraft_width,
-            centre_x=self.aircraft_centre_x,
-            centre_y=self.aircraft_centre_y,
             yaw=self.hitch_angle,
-            red=1.0,
-            green=0.4,
-            blue=0.1,
         )
 
         self.tug_pub.publish(tug)
         self.aircraft_pub.publish(aircraft)
 
     @staticmethod
-    def make_marker(
-        stamp,
+    def create_marker(
+        header,
         marker_id,
-        length,
-        width,
         centre_x,
         centre_y,
+        length,
+        width,
         yaw,
-        red,
-        green,
-        blue,
     ):
         marker = Marker()
-        marker.header.stamp = stamp
-        marker.header.frame_id = "velodyne"
-        marker.ns = "simulated_geometry"
+        marker.header = header
+        marker.ns = "vehicle_geometry"
         marker.id = marker_id
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
@@ -599,9 +507,9 @@ class OccupancyGridNode(Node):
         marker.scale.y = width
         marker.scale.z = 2.0
 
-        marker.color.r = red
-        marker.color.g = green
-        marker.color.b = blue
+        marker.color.r = 1.0
+        marker.color.g = 0.4
+        marker.color.b = 0.1
         marker.color.a = 0.30
 
         return marker
