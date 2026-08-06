@@ -20,13 +20,15 @@ class OccupancyGridNode(Node):
     def __init__(self):
         super().__init__("occupancy_grid_node")
 
-        # Point-cloud input
+        # Input from Patchwork++.
         self.declare_parameter(
             "input_topic",
-            "/patchworkpp/nonground",
+            # change to use nonground topic
+            # "/patchworkpp/nonground",
+             "/rslidar_points",
         )
 
-        # Mapping/ROI area
+        # Region of interest.
         self.declare_parameter("x_min", -10.0)
         self.declare_parameter("x_max", 50.0)
         self.declare_parameter("y_min", -25.0)
@@ -34,16 +36,16 @@ class OccupancyGridNode(Node):
         self.declare_parameter("z_min", -1.2)
         self.declare_parameter("z_max", 2.5)
 
-        # Grid settings
+        # Occupancy grid settings
         self.declare_parameter("resolution", 0.20)
         self.declare_parameter("min_points_per_cell", 2)
         self.declare_parameter("angle_bins", 720)
 
-        # Simulated tug
+        # Tug dimensions used only for marker visualization
         self.declare_parameter("tug_length", 6.0)
         self.declare_parameter("tug_width", 3.0)
 
-        # Simulated aircraft
+        # Aircraft dimensions used only for marker visualization
         self.declare_parameter("aircraft_length", 35.0)
         self.declare_parameter("aircraft_width", 30.0)
         self.declare_parameter("hitch_distance", 8.0)
@@ -63,9 +65,11 @@ class OccupancyGridNode(Node):
         self.resolution = float(
             self.get_parameter("resolution").value
         )
+
         self.min_points = int(
             self.get_parameter("min_points_per_cell").value
         )
+
         self.angle_bins = int(
             self.get_parameter("angle_bins").value
         )
@@ -73,6 +77,7 @@ class OccupancyGridNode(Node):
         self.tug_length = float(
             self.get_parameter("tug_length").value
         )
+
         self.tug_width = float(
             self.get_parameter("tug_width").value
         )
@@ -80,41 +85,53 @@ class OccupancyGridNode(Node):
         self.aircraft_length = float(
             self.get_parameter("aircraft_length").value
         )
+
         self.aircraft_width = float(
             self.get_parameter("aircraft_width").value
         )
+
         self.hitch_distance = float(
             self.get_parameter("hitch_distance").value
         )
+
         self.hitch_angle = math.radians(
             float(self.get_parameter("hitch_angle_deg").value)
         )
 
         self.validate_parameters()
 
-        self.width = math.ceil(
-            (self.x_max - self.x_min) / self.resolution
-        )
-        self.height = math.ceil(
-            (self.y_max - self.y_min) / self.resolution
+        self.width = int(
+            math.ceil(
+                (self.x_max - self.x_min) / self.resolution
+            )
         )
 
+        self.height = int(
+            math.ceil(
+                (self.y_max - self.y_min) / self.resolution
+            )
+        )
+
+        # LiDAR position inside the grid
         self.sensor_x = int(
             (0.0 - self.x_min) / self.resolution
         )
+
         self.sensor_y = int(
             (0.0 - self.y_min) / self.resolution
         )
 
-        # Aircraft centre relative to the tug.
+        # Aircraft marker position relative to the tug
         self.aircraft_x = (
             self.tug_length / 2.0
             + self.hitch_distance
             + self.aircraft_length / 2.0
         )
+
         self.aircraft_y = 0.0
 
-        self.self_mask = self.create_self_mask()
+        #  tug and aircraft exclusion cells
+        # self.self_mask = self.create_self_mask()
 
         map_qos = QoSProfile(
             depth=1,
@@ -162,9 +179,14 @@ class OccupancyGridNode(Node):
         self.get_logger().info(
             f"Listening to {self.input_topic}"
         )
+
         self.get_logger().info(
             f"Grid: {self.width} x {self.height}, "
             f"{self.resolution:.2f} m/cell"
+        )
+
+        self.get_logger().info(
+            "Tug and aircraft object removal is disabled"
         )
 
     def validate_parameters(self):
@@ -187,11 +209,13 @@ class OccupancyGridNode(Node):
 
     def cloud_callback(self, msg):
         try:
-            field_names = {field.name for field in msg.fields}
+            field_names = {
+                field.name for field in msg.fields
+            }
 
             if not {"x", "y", "z"}.issubset(field_names):
                 self.get_logger().error(
-                    "Point cloud does not contain x, y and z fields"
+                    "Point cloud requires x, y and z fields"
                 )
                 return
 
@@ -209,8 +233,8 @@ class OccupancyGridNode(Node):
             if len(points) == 0:
                 return
 
-            # Keep the required region and height.
-            roi = (
+            # Keep points inside the chosen ROI and height.
+            roi_mask = (
                 (points[:, 0] >= self.x_min)
                 & (points[:, 0] < self.x_max)
                 & (points[:, 1] >= self.y_min)
@@ -219,15 +243,18 @@ class OccupancyGridNode(Node):
                 & (points[:, 2] <= self.z_max)
             )
 
-            before_mask = points[roi]
+            before_mask = points[roi_mask]
 
-            # Ignore tug and aircraft regions.
-            self_points = (
-                self.inside_tug(before_mask)
-                | self.inside_aircraft(before_mask)
-            )
+            # Remove points inside tug and aircraft
+            # self_points = (
+            #     self.inside_tug(before_mask)
+            #     | self.inside_aircraft(before_mask)
+            # )
+            #
+            # after_mask = before_mask[~self_points]
 
-            after_mask = before_mask[~self_points]
+            # Keep all ROI points as possible obstacles.
+            after_mask = before_mask
 
             self.before_pub.publish(
                 point_cloud2.create_cloud_xyz32(
@@ -243,13 +270,14 @@ class OccupancyGridNode(Node):
                 )
             )
 
-            self.grid_pub.publish(
-                self.create_grid(
-                    after_mask,
-                    msg.header,
-                )
+            grid_message = self.create_grid(
+                after_mask,
+                msg.header,
             )
 
+            self.grid_pub.publish(grid_message)
+
+            # Markers remain visualization only.
             self.publish_markers(msg.header)
 
             self.get_logger().info(
@@ -264,12 +292,16 @@ class OccupancyGridNode(Node):
             )
 
     def inside_tug(self, points):
+        """Unused while self-object removal is disabled."""
+
         return (
             (np.abs(points[:, 0]) <= self.tug_length / 2.0)
             & (np.abs(points[:, 1]) <= self.tug_width / 2.0)
         )
 
     def inside_aircraft(self, points):
+        """Unused while self-object removal is disabled."""
+
         dx = points[:, 0] - self.aircraft_x
         dy = points[:, 1] - self.aircraft_y
 
@@ -284,50 +316,15 @@ class OccupancyGridNode(Node):
             & (np.abs(local_y) <= self.aircraft_width / 2.0)
         )
 
-    def create_self_mask(self):
-        x = (
-            self.x_min
-            + (np.arange(self.width) + 0.5)
-            * self.resolution
-        )
-
-        y = (
-            self.y_min
-            + (np.arange(self.height) + 0.5)
-            * self.resolution
-        )
-
-        grid_x, grid_y = np.meshgrid(x, y)
-
-        tug = (
-            (np.abs(grid_x) <= self.tug_length / 2.0)
-            & (np.abs(grid_y) <= self.tug_width / 2.0)
-        )
-
-        dx = grid_x - self.aircraft_x
-        dy = grid_y - self.aircraft_y
-
-        cosine = math.cos(self.hitch_angle)
-        sine = math.sin(self.hitch_angle)
-
-        local_x = cosine * dx + sine * dy
-        local_y = -sine * dx + cosine * dy
-
-        aircraft = (
-            (np.abs(local_x) <= self.aircraft_length / 2.0)
-            & (np.abs(local_y) <= self.aircraft_width / 2.0)
-        )
-
-        return tug | aircraft
-
     def create_grid(self, points, header):
+        # Begin with all cells unknown.
         grid = np.full(
             (self.height, self.width),
             -1,
             dtype=np.int8,
         )
 
-        if len(points):
+        if len(points) > 0:
             grid_x = (
                 (points[:, 0] - self.x_min)
                 / self.resolution
@@ -338,38 +335,86 @@ class OccupancyGridNode(Node):
                 / self.resolution
             ).astype(np.int32)
 
-            linear = grid_y * self.width + grid_x
+            valid_indices = (
+                (grid_x >= 0)
+                & (grid_x < self.width)
+                & (grid_y >= 0)
+                & (grid_y < self.height)
+            )
+
+            points = points[valid_indices]
+            grid_x = grid_x[valid_indices]
+            grid_y = grid_y[valid_indices]
+
+            linear = (
+                grid_y * self.width + grid_x
+            )
 
             counts = np.bincount(
                 linear,
                 minlength=self.width * self.height,
             )
 
-            valid = counts[linear] >= self.min_points
+            enough_points = (
+                counts[linear] >= self.min_points
+            )
 
-            valid_points = points[valid]
-            occupied = np.unique(linear[valid])
+            valid_points = points[enough_points]
+            occupied = np.unique(
+                linear[enough_points]
+            )
 
-            self.mark_free_space(grid, valid_points)
+            # Mark visible cells before obstacles as free
+            self.mark_free_space(
+                grid,
+                valid_points,
+            )
 
+            # Mark obstacle cells as occupied
             occupied_y = occupied // self.width
             occupied_x = occupied % self.width
 
-            grid[occupied_y, occupied_x] = 100
+            grid[
+                occupied_y,
+                occupied_x,
+            ] = 100
 
-        # Tug and aircraft cells stay unknown.
-        grid[self.self_mask] = -1
+        # Force tug and aircraft areas to unknown
+        # grid[self.self_mask] = -1
 
+        # Do not remove or overwrite any object areas
         message = OccupancyGrid()
         message.header = header
+
         message.info.map_load_time = header.stamp
         message.info.resolution = self.resolution
         message.info.width = self.width
         message.info.height = self.height
+
         message.info.origin.position.x = self.x_min
         message.info.origin.position.y = self.y_min
+        message.info.origin.position.z = 0.0
         message.info.origin.orientation.w = 1.0
+
         message.data = grid.flatten().tolist()
+
+        occupied_count = int(
+            np.count_nonzero(grid == 100)
+        )
+
+        free_count = int(
+            np.count_nonzero(grid == 0)
+        )
+
+        unknown_count = int(
+            np.count_nonzero(grid == -1)
+        )
+
+        self.get_logger().info(
+            f"Grid cells: occupied={occupied_count}, "
+            f"free={free_count}, "
+            f"unknown={unknown_count}"
+        )
 
         return message
 
@@ -387,19 +432,21 @@ class OccupancyGridNode(Node):
             * self.angle_bins
         ).astype(np.int32) % self.angle_bins
 
-        distance = (
+        squared_distance = (
             points[:, 0] ** 2
             + points[:, 1] ** 2
         )
 
-        order = np.argsort(distance)
+        order = np.argsort(squared_distance)
 
-        _, first = np.unique(
+        _, first_indices = np.unique(
             angle_ids[order],
             return_index=True,
         )
 
-        nearest_points = points[order[first]]
+        nearest_points = points[
+            order[first_indices]
+        ]
 
         for point in nearest_points:
             end_x = int(
@@ -420,10 +467,17 @@ class OccupancyGridNode(Node):
             )
 
             for cell_x, cell_y in ray[:-1]:
+
+                # if (
+                #     0 <= cell_x < self.width
+                #     and 0 <= cell_y < self.height
+                #     and not self.self_mask[cell_y, cell_x]
+                # ):
+                #     grid[cell_y, cell_x] = 0
+
                 if (
                     0 <= cell_x < self.width
                     and 0 <= cell_y < self.height
-                    and not self.self_mask[cell_y, cell_x]
                 ):
                     grid[cell_y, cell_x] = 0
 
@@ -456,8 +510,8 @@ class OccupancyGridNode(Node):
                 y0 += step_y
 
     def publish_markers(self, header):
-        tug = self.create_marker(
-            header,
+        tug_marker = self.create_marker(
+            header=header,
             marker_id=0,
             centre_x=0.0,
             centre_y=0.0,
@@ -466,8 +520,8 @@ class OccupancyGridNode(Node):
             yaw=0.0,
         )
 
-        aircraft = self.create_marker(
-            header,
+        aircraft_marker = self.create_marker(
+            header=header,
             marker_id=1,
             centre_x=self.aircraft_x,
             centre_y=self.aircraft_y,
@@ -476,8 +530,8 @@ class OccupancyGridNode(Node):
             yaw=self.hitch_angle,
         )
 
-        self.tug_pub.publish(tug)
-        self.aircraft_pub.publish(aircraft)
+        self.tug_pub.publish(tug_marker)
+        self.aircraft_pub.publish(aircraft_marker)
 
     @staticmethod
     def create_marker(
@@ -517,12 +571,15 @@ class OccupancyGridNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = OccupancyGridNode()
 
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
+
     finally:
         node.destroy_node()
 
