@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 import rclpy
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid 
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
