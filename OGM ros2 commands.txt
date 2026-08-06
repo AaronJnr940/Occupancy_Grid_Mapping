@@ -1,0 +1,40 @@
+Pointclouds pub
+********************************
+ros2 run lidar_ds_player pointcloud_pub
+**********************
+
+Launch Patchwork++
+************************************
+source ~/ground_segmentation_ws/install/setup.bash   ----  #source patchworkpp correctly!
+ros2 launch patchworkpp patchworkpp.launch.py cloud_topic:=/points_raw
+*******************************
+
+
+Cloud Exporter
+******************************
+cd ~/ground_segmentation_ws
+colcon build --packages-select cloud_exporter
+source install/setup.bash
+****************************
+
+RVIZ
+*******************
+source /opt/ros/humble/setup.bash
+source ~/ground_segmentation_ws/install/setup.bash
+rviz2
+********************
+
+
+Occupancy Grid Mapping main pipeline
+***********************
+source /opt/ros/humble/setup.bash
+source ~/ground_segmentation_ws/install/setup.bash
+T1: ros2 run occupancy_grid_mapper occupancy_grid_node
+T2: ros2 run lidar_ds_player pointcloud_pub --ros-args -p dataset_path:=/home/leon/KITTI_roi_filtered/dataset  -p rate_hz:=1.0
+T3: ros2 run roi_filter exclusion_marker_node
+T4: rviz2
+***************************
+
+Sipmlified pipeline
+T1: ros2 run occupancy_grid_mapper occupancy_grid_node --ros-args -p hitch_angle_deg:=20.0 ..with hitch angle [removable]
+T2: rviz2
