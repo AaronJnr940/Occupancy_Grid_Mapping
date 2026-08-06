@@ -1,0 +1,29 @@
+
+
+Terminal 1
+source /opt/ros/humble/setup.bash
+ros2 bag play /home/leon/lidar_run_01 --loop
+
+
+Terminal 2
+source /opt/ros/humble/setup.bash
+source ~/ground_segmentation_ws/install/setup.bash
+
+ros2 launch patchworkpp patchworkpp.launch.py  cloud_topic:=/rslidar_points base_frame:=rslidar
+
+
+Terminal 3
+ros2 run occupancy_grid_mapper occupancy_grid_node
+
+
+Terminal 4
+rviz2
+ 
+note: set Fixed Frame = rslidar in rviz
+
+
+
+
+
+
+
